@@ -1,0 +1,179 @@
+This is a significantly more advanced version of the project than what we were working on in this conversation — it has grown into a full 3-device system. Here is my complete review:
+
+---
+
+## Overall Architecture
+
+The project has evolved well into a clean 3-device pipeline:
+
+```
+Sensor Node (ESP32-C3) → UART → Relay Controller (ESP32-WROOM) → UART → CrowPanel HMI
+                                         ↓
+                                    RainMaker (WiFi)
+```
+
+This is a solid design. Using UART instead of ESP-NOW eliminates the WiFi channel conflict problem that was crashing the code in this conversation. Good decision.
+
+---
+
+## Issues Found
+
+### 🔴 Critical
+
+**1 — PACKET_END_BYTE collision with payload data**
+
+In both `handleUARTReceive()` and `handleSensorUARTReceive()`, the packet parser triggers on `0x55` end byte but there is a comment acknowledging the problem:
+
+```cpp
+// If length doesn't match, 0x55 is part of payload — keep accumulating
+```
+
+The logic `if (b == PACKET_END_BYTE && rxIndex >= 5)` fires on every `0x55` byte in the stream regardless of whether it is actually the end byte. For example if a float value like `totalLiters` contains `0x55` in its binary representation, the parser will incorrectly think a packet ended mid-stream and process garbage data.
+
+**Fix** — use a length-first approach instead of end-byte detection:
+
+```cpp
+// After reading cmd and length bytes, read exactly length+2 more bytes
+// (checksum + end byte) — no need to scan for 0x55 at all
+if (sensorRxIndex >= 3) {                          // have cmd + len
+    uint8_t expectedLen = sensorRxBuffer[2];
+    if (sensorRxIndex == expectedLen + 5) {        // complete packet
+        // validate checksum and end byte
+        if (sensorRxBuffer[sensorRxIndex-1] == PACKET_END_BYTE) {
+            // process
+        }
+        sensorPacketStarted = false;
+        sensorRxIndex = 0;
+    }
+}
+```
+
+**2 — SHT20 first read after boot discards warmup**
+
+In `setup()` the sensor is read immediately after `begin()` + 100ms delay with no warmup discard:
+
+```cpp
+sht.begin();
+delay(100);
+if (sht.read()) {
+    lastTemp = sht.getTemperature();
+    lastHum = sht.getHumidity();
+}
+```
+
+As we discovered in this conversation, the SHT20 often returns `-39.8°C` on the first read. Add a discard read:
+
+```cpp
+sht.begin();
+delay(100);
+sht.read();   // discard first read
+delay(100);
+if (sht.read()) {
+    float t = sht.getTemperature();
+    float h = sht.getHumidity();
+    if (t > -40.0 && t < 125.0 && h >= 0.0 && h <= 100.0) {
+        lastTemp = t;
+        lastHum  = h;
+    }
+}
+```
+
+**3 — SHT20 loop read has no sanity check**
+
+```cpp
+// In loop():
+if (probeSht() && sht.read()) {
+    lastTemp = sht.getTemperature();
+    lastHum = sht.getHumidity();
+    rm_temp.updateAndReportParam(...);
+    rm_hum.updateAndReportParam(...);
+}
+```
+
+If a bad read returns `-39.8°C` it goes straight to RainMaker and the display with no guard. Add the same sanity check used in the sensor node:
+
+```cpp
+if (probeSht() && sht.read()) {
+    float t = sht.getTemperature();
+    float h = sht.getHumidity();
+    if (t > -40.0 && t < 125.0 && h >= 0.0 && h <= 100.0) {
+        lastTemp = t;
+        lastHum  = h;
+        rm_temp.updateAndReportParam(ESP_RMAKER_DEF_TEMPERATURE_NAME, lastTemp);
+        rm_hum.updateAndReportParam("Humidity", lastHum);
+    }
+}
+```
+
+---
+
+### 🟡 Medium
+
+**4 — GPIO 14 and 27 are used by both buttons and UART**
+
+In `protocol.h`:
+```cpp
+#define WROOM_SENSOR_UART_RX 14
+#define WROOM_SENSOR_UART_TX 27
+```
+
+In `main.cpp`:
+```cpp
+// BTN_TOGGLE is GPIO 26 — OK
+// But BTN_WIFI is 12, BTN_SELECT is 13
+```
+
+GPIO 14 is Serial1 RX and GPIO 27 is Serial1 TX — these are not used as buttons so there is no conflict here. However GPIO 27 was previously used as `BTN_TOGGLE` in some versions. Confirm `BTN_TOGGLE = 26` is correct and GPIO 27 is purely UART TX.
+
+**5 — `rm_relay[]` global static array crash risk**
+
+This is the same issue we debugged extensively in this conversation. The global static `Switch rm_relay[16]` array initializes before RainMaker is ready and has crashed in testing. The repo has kept this pattern — it worked in the last tested version but remains fragile. If you ever see `LoadProhibited` crashes again, converting to pointer-based initialization in `setup()` is the fix.
+
+**6 — DS18B20 temperature bounds too wide**
+
+```cpp
+if (temp != DEVICE_DISCONNECTED_C && temp > -50.0f && temp < 85.0f)
+```
+
+`-50°C` is below the DS18B20's rated range of `-55°C` minimum, but more importantly for irrigation water you would never expect below `0°C` in normal operation. Consider tightening to `> -10.0f` to catch sensor errors earlier while still allowing for freezing temperature alarms.
+
+**7 — `numAlarms` logic**
+
+```cpp
+if (idx >= numAlarms) numAlarms = idx + 1;
+```
+
+If alarm index 5 arrives before index 3, `numAlarms` becomes 6 but alarms 0-2 are uninitialised. Since `memset(alarms, 0, sizeof(alarms))` zeroes everything at boot this is safe, but worth a comment to explain the assumption.
+
+---
+
+### 🟢 Minor / Good practices already in place
+
+**8 — Hardware watchdog in sensor node** ✅ Good — `esp_task_wdt_init(10, true)` will reset the C3 if it stalls. Consider adding the same to the Wroom.
+
+**9 — totalLiters persistence** ✅ Saving to NVS every 5 minutes or 100L is well thought out and survives power cuts.
+
+**10 — Non-blocking DS18B20 reads** ✅ The conversion-pending flag pattern is correct and avoids the 750ms blocking delay per cycle.
+
+**11 — ADS1115 auto-reprobe** ✅ Good defensive pattern, mirrors the MCP23017 hot-plug detection.
+
+**12 — XOR checksum is weak** Not a bug, but XOR checksums don't detect all multi-bit errors or transpositions. For a more robust protocol consider CRC-8 (just a lookup table, very cheap on ESP32). For an irrigation controller this is probably fine.
+
+**13 — `sendFullStatus()` called 3 times per button press** In `loop()` both `sendFullStatus()` and `updateDisplay()` are called from the toggle button handler, but `sendFullStatus()` is also called from the periodic 2-second timer. No correctness issue, just slightly redundant on button press.
+
+---
+
+## Summary
+
+| Severity | Issue | Fix needed |
+|---|---|---|
+| 🔴 Critical | End-byte collision in UART parser | Length-first parsing |
+| 🔴 Critical | SHT20 no warmup discard at boot | Add discard read |
+| 🔴 Critical | SHT20 no sanity check in loop | Add bounds check |
+| 🟡 Medium | Static relay array crash risk | Convert to pointers if crash returns |
+| 🟡 Medium | DS18B20 bounds too wide | Tighten lower bound |
+| 🟡 Medium | numAlarms gap assumption | Add comment |
+| 🟢 Minor | Watchdog only on C3 | Add to Wroom too |
+| 🟢 Minor | XOR checksum weakness | Acceptable for this use case |
+
+The architecture is clean and well thought out. The UART protocol design is solid and the sensor node is particularly well written with the non-blocking DS18B20 and NVS persistence. The three critical issues are all fixable in under 30 lines total.
