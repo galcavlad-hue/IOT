@@ -1,0 +1,159 @@
+/*
+ * ESP32-C3 Sensor Node
+ * Reads water meter, water temperature, rain sensor, and wind speed.
+ * Sends sensor data to Wroom via UART every 2 seconds using framed protocol.
+ *
+ * UART1: TX=GPIO6 → Wroom GPIO14 (RX)
+ * I2C:   SDA=GPIO8, SCL=GPIO9 → ADS1115 (addr 0x49, ADDR→VDD)
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include "protocol.h"
+
+// ---- Pin definitions ----
+#define FLOW_PIN    3
+#define DS18B20_PIN 4
+#define RAIN_DO_PIN 5
+#define RAIN_AO_PIN 0
+#define I2C_SDA     8
+#define I2C_SCL     9
+
+// ---- ADS1115 (address 0x49: ADDR pin tied to VDD) ----
+// Channel A0: Wind speed sensor (0-5V output, 0-60 m/s)
+// ADS1115 gain = GAIN_ONE → ±4.096V (1 bit = 0.125mV)
+Adafruit_ADS1115 ads;
+bool adsOnline = false;
+
+// ---- DS18B20 ----
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature ds18b20(&oneWire);
+
+// ---- Flow sensor ----
+volatile uint32_t pulseCount = 0;
+float totalLiters = 0;
+
+void IRAM_ATTR onPulse() {
+    pulseCount++;
+}
+
+// ---- Sensor data ----
+sensor_data_payload_t sensorData;
+
+// ---- Read all sensors ----
+void readSensors(uint32_t intervalMs) {
+    // DS18B20
+    ds18b20.requestTemperatures();
+    sensorData.temperature = ds18b20.getTempCByIndex(0);
+
+    // Flow
+    noInterrupts();
+    uint32_t pulses = pulseCount;
+    pulseCount = 0;
+    interrupts();
+
+    totalLiters += pulses / 450.0;
+    sensorData.totalLiters = totalLiters;
+    sensorData.flowRate = (pulses / 450.0) * (60000.0 / intervalMs); // L/min
+
+    // Rain
+    sensorData.isRaining = (digitalRead(RAIN_DO_PIN) == LOW) ? 1 : 0;
+    sensorData.rainAnalog = analogRead(RAIN_AO_PIN);
+
+    // Wind speed via ADS1115 channel A0
+    // Sensor output: 1-5V (1V = 0 m/s, 5V = 60 m/s, <1V = sensor error)
+    // Gain = GAIN_TWOTHIRDS: ±6.144V range, 1 bit = 0.1875mV
+    if (adsOnline) {
+        int16_t rawAdc = ads.readADC_SingleEnded(0);
+        float voltage = ads.computeVolts(rawAdc);
+        if (voltage < 1.0f) {
+            // Below 1V = sensor error or disconnected
+            sensorData.windSpeed = 0.0f;
+        } else {
+            // 1V→0 m/s, 5V→60 m/s: windSpeed = (voltage - 1) / 4 * 60
+            sensorData.windSpeed = ((voltage - 1.0f) / 4.0f) * 60.0f;
+        }
+    } else {
+        sensorData.windSpeed = 0.0f;
+    }
+}
+
+// ---- Send framed UART packet ----
+void sendSensorPacket() {
+    uint8_t packet[MAX_PACKET_SIZE + 5];
+    uint8_t idx = 0;
+    uint8_t payloadLen = sizeof(sensor_data_payload_t);
+
+    packet[idx++] = PACKET_START_BYTE;
+    packet[idx++] = CMD_SENSOR_DATA;
+    packet[idx++] = payloadLen;
+
+    uint8_t checksum = CMD_SENSOR_DATA ^ payloadLen;
+    const uint8_t* payload = (const uint8_t*)&sensorData;
+    for (uint8_t i = 0; i < payloadLen; i++) {
+        packet[idx++] = payload[i];
+        checksum ^= payload[i];
+    }
+
+    packet[idx++] = checksum;
+    packet[idx++] = PACKET_END_BYTE;
+
+    Serial1.write(packet, idx);
+}
+
+// ---- Serial print ----
+void printSensors() {
+    Serial.printf("Temp: %.2f C | Total: %.3f L | Flow: %.2f L/min | Rain: %s | RainRaw: %d | Wind: %.1f m/s\n",
+                  sensorData.temperature,
+                  sensorData.totalLiters,
+                  sensorData.flowRate,
+                  sensorData.isRaining ? "YES" : "NO",
+                  sensorData.rainAnalog,
+                  sensorData.windSpeed);
+}
+
+void setup() {
+    Serial.begin(115200);
+
+    // UART1 to Wroom
+    Serial1.begin(UART_BAUD_RATE, SERIAL_8N1, SENSOR_NODE_UART_RX, SENSOR_NODE_UART_TX);
+
+    // I2C for ADS1115
+    Wire.begin(I2C_SDA, I2C_SCL);
+
+    // ADS1115 at address 0x49 (ADDR pin → VDD)
+    if (ads.begin(0x49, &Wire)) {
+        ads.setGain(GAIN_TWOTHIRDS);  // ±6.144V range (covers 0-5V sensor)
+        adsOnline = true;
+        Serial.println("ADS1115 online at 0x49");
+    } else {
+        adsOnline = false;
+        Serial.println("WARNING: ADS1115 not found at 0x49!");
+    }
+
+    // Flow sensor
+    pinMode(FLOW_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(FLOW_PIN), onPulse, FALLING);
+
+    // Rain sensor
+    pinMode(RAIN_DO_PIN, INPUT);
+
+    // DS18B20
+    ds18b20.begin();
+
+    Serial.println("Sensor Node ready (UART mode)");
+}
+
+void loop() {
+    static uint32_t lastSend = 0;
+    if (millis() - lastSend >= 2000) {
+        lastSend = millis();
+        readSensors(2000);
+        sendSensorPacket();
+        printSensors();
+    }
+    delay(10);
+}
