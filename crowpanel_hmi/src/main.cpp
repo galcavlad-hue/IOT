@@ -212,26 +212,30 @@ void handleUartReceive() {
             continue;
         }
 
-        if (b == PACKET_END_BYTE && uartRxIdx >= 5) {
-            uint8_t cmd = uartRxBuf[1];
-            uint8_t len = uartRxBuf[2];
-
-            if (uartRxIdx == (uint8_t)(len + 5)) {
-                // Verify checksum
-                uint8_t checksum = cmd ^ len;
-                for (uint8_t i = 0; i < len; i++) {
+        // Use length-based parsing: calculate expected packet size from length field
+        if (uartRxIdx >= 3) {
+            uint8_t payloadLen = uartRxBuf[2];
+            uint8_t expectedTotal = 5 + payloadLen;  // START + CMD + LEN + PAYLOAD + CHECKSUM + END
+            
+            if (uartRxIdx == expectedTotal) {
+                // Packet complete: validate checksum and end byte
+                uint8_t cmd = uartRxBuf[1];
+                uint8_t checksum = cmd ^ payloadLen;
+                for (uint8_t i = 0; i < payloadLen; i++) {
                     checksum ^= uartRxBuf[3 + i];
                 }
 
-                if (checksum == uartRxBuf[3 + len]) {
-                    processUartPacket(cmd, &uartRxBuf[3], len);
+                if (uartRxBuf[expectedTotal - 1] == PACKET_END_BYTE &&
+                    checksum == uartRxBuf[3 + payloadLen]) {
+                    processUartPacket(cmd, &uartRxBuf[3], payloadLen);
+                } else if (uartRxBuf[expectedTotal - 1] != PACKET_END_BYTE) {
+                    Serial.println("UART end byte missing");
                 } else {
                     Serial.println("UART checksum error");
                 }
                 uartPacketStarted = false;
                 uartRxIdx = 0;
             }
-            // If length doesn't match, 0x55 is part of payload — keep accumulating
         }
     }
 }

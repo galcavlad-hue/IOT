@@ -20,6 +20,7 @@
 #include <Adafruit_MCP23X17.h>
 #include <SHT2x.h>
 #include <time.h>
+#include <esp_task_wdt.h>
 #include "protocol.h"
 
 // ============================================================
@@ -376,25 +377,30 @@ void handleSensorUARTReceive() {
             continue;
         }
 
-        if (b == PACKET_END_BYTE && sensorRxIndex >= 5) {
-            uint8_t cmd = sensorRxBuffer[1];
-            uint8_t len = sensorRxBuffer[2];
-
-            if (sensorRxIndex == len + 5) {
-                uint8_t checksum = cmd ^ len;
-                for (uint8_t i = 0; i < len; i++) {
+        // Use length-based parsing: calculate expected packet size from length field
+        if (sensorRxIndex >= 3) {
+            uint8_t payloadLen = sensorRxBuffer[2];
+            uint8_t expectedTotal = 5 + payloadLen;  // START + CMD + LEN + PAYLOAD + CHECKSUM + END
+            
+            if (sensorRxIndex == expectedTotal) {
+                // Packet complete: validate checksum and end byte
+                uint8_t cmd = sensorRxBuffer[1];
+                uint8_t checksum = cmd ^ payloadLen;
+                for (uint8_t i = 0; i < payloadLen; i++) {
                     checksum ^= sensorRxBuffer[3 + i];
                 }
 
-                if (checksum == sensorRxBuffer[3 + len]) {
-                    processSensorPacket(cmd, &sensorRxBuffer[3], len);
+                if (sensorRxBuffer[expectedTotal - 1] == PACKET_END_BYTE &&
+                    checksum == sensorRxBuffer[3 + payloadLen]) {
+                    processSensorPacket(cmd, &sensorRxBuffer[3], payloadLen);
+                } else if (sensorRxBuffer[expectedTotal - 1] != PACKET_END_BYTE) {
+                    Serial.println("[Sensor] UART end byte missing");
                 } else {
                     Serial.println("[Sensor] UART checksum error");
                 }
                 sensorPacketStarted = false;
                 sensorRxIndex = 0;
             }
-            // If length doesn't match, 0x55 is part of payload — keep accumulating
         }
     }
 }
@@ -430,6 +436,9 @@ void processUARTPacket(uint8_t cmd, const uint8_t* payload, uint8_t len) {
                     alarms[idx].permanent = alm->permanent;
                     alarms[idx].sensor_value = alm->sensor_value;
                     alarms[idx].threshold = alm->threshold;
+                    // Note: numAlarms tracks the highest index+1. If alarm indices arrive
+                    // out of order (e.g., index 5 before 3), intermediate slots remain
+                    // initialized to 0 from memset(alarms,...) at boot. This is safe.
                     if (idx >= numAlarms) numAlarms = idx + 1;
 
                     Serial.printf("Alarm %d: type=%d triggered=%d value=%.1f threshold=%.1f\n",
@@ -469,25 +478,30 @@ void handleUARTReceive() {
             continue;
         }
 
-        if (b == PACKET_END_BYTE && rxIndex >= 5) {
-            uint8_t cmd = rxBuffer[1];
-            uint8_t len = rxBuffer[2];
-
-            if (rxIndex == len + 5) {
-                uint8_t checksum = cmd ^ len;
-                for (uint8_t i = 0; i < len; i++) {
+        // Use length-based parsing: calculate expected packet size from length field
+        if (rxIndex >= 3) {
+            uint8_t payloadLen = rxBuffer[2];
+            uint8_t expectedTotal = 5 + payloadLen;  // START + CMD + LEN + PAYLOAD + CHECKSUM + END
+            
+            if (rxIndex == expectedTotal) {
+                // Packet complete: validate checksum and end byte
+                uint8_t cmd = rxBuffer[1];
+                uint8_t checksum = cmd ^ payloadLen;
+                for (uint8_t i = 0; i < payloadLen; i++) {
                     checksum ^= rxBuffer[3 + i];
                 }
 
-                if (checksum == rxBuffer[3 + len]) {
-                    processUARTPacket(cmd, &rxBuffer[3], len);
+                if (rxBuffer[expectedTotal - 1] == PACKET_END_BYTE &&
+                    checksum == rxBuffer[3 + payloadLen]) {
+                    processUARTPacket(cmd, &rxBuffer[3], payloadLen);
+                } else if (rxBuffer[expectedTotal - 1] != PACKET_END_BYTE) {
+                    Serial.println("UART end byte missing");
                 } else {
                     Serial.println("UART checksum error");
                 }
                 packetStarted = false;
                 rxIndex = 0;
             }
-            // If length doesn't match, 0x55 is part of payload — keep accumulating
         }
     }
 }
@@ -578,6 +592,11 @@ void rainmakerUpdateAlarm(uint8_t alarm_index, bool triggered, uint8_t alarm_typ
 // ============================================================
 void setup() {
   Serial.begin(115200);
+  
+  // Hardware watchdog: reset if loop stalls > 10 seconds
+  esp_task_wdt_init(10, true);
+  esp_task_wdt_add(NULL);
+  
   pinMode(gpio_0, INPUT);
   pinMode(BTN_WIFI, INPUT_PULLUP);
   pinMode(BTN_SELECT, INPUT_PULLUP);
@@ -612,9 +631,19 @@ void setup() {
   if (shtOnline) {
     sht.begin();
     delay(100);
+    // Discard first read (often returns -39.8°C after reset)
+    sht.read();
+    delay(100);
     if (sht.read()) {
-      lastTemp = sht.getTemperature();
-      lastHum = sht.getHumidity();
+      float t = sht.getTemperature();
+      float h = sht.getHumidity();
+      // Apply sanity check on initial read
+      if (t > -40.0 && t < 125.0 && h >= 0.0 && h <= 100.0) {
+        lastTemp = t;
+        lastHum = h;
+      } else {
+        Serial.printf("[SHT] Initial read out of range: T=%.1f H=%.1f (sanitized)\n", t, h);
+      }
     }
   }
 
@@ -756,6 +785,9 @@ void setup() {
 // Main Loop
 // ============================================================
 void loop() {
+  // Feed watchdog first (safety-critical)
+  esp_task_wdt_reset();
+  
   static unsigned long lastDisplay = 0, lastMcpProbe = 0, lastSensor = 0, lastStatusSend = 0;
   unsigned long now = millis();
 
@@ -803,10 +835,17 @@ void loop() {
   if (now - lastSensor >= 30000) {
     lastSensor = now;
     if (probeSht() && sht.read()) {
-      lastTemp = sht.getTemperature();
-      lastHum = sht.getHumidity();
-      rm_temp.updateAndReportParam(ESP_RMAKER_DEF_TEMPERATURE_NAME, lastTemp);
-      rm_hum.updateAndReportParam("Humidity", lastHum);
+      float t = sht.getTemperature();
+      float h = sht.getHumidity();
+      // Sanity check: valid SHT20 range is -40~125°C, 0~100%
+      if (t > -40.0 && t < 125.0 && h >= 0.0 && h <= 100.0) {
+        lastTemp = t;
+        lastHum = h;
+        rm_temp.updateAndReportParam(ESP_RMAKER_DEF_TEMPERATURE_NAME, lastTemp);
+        rm_hum.updateAndReportParam("Humidity", lastHum);
+      } else {
+        Serial.printf("[SHT] Read out of range: T=%.1f H=%.1f (rejected)\n", t, h);
+      }
     }
   }
 

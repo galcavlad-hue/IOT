@@ -62,7 +62,9 @@ void readSensors(uint32_t intervalMs) {
     if (ds18b20ConversionPending &&
         (millis() - ds18b20RequestTime >= DS18B20_CONVERSION_MS)) {
         float temp = ds18b20.getTempCByIndex(0);
-        if (temp != DEVICE_DISCONNECTED_C && temp > -50.0f && temp < 85.0f) {
+        // DS18B20 rated range: -55°C to +125°C, but for irrigation expect > -10°C
+        // (catches disconnected sensor and cold-water anomalies early)
+        if (temp != DEVICE_DISCONNECTED_C && temp > -10.0f && temp < 85.0f) {
             sensorData.temperature = temp;
         }
         ds18b20ConversionPending = false;
