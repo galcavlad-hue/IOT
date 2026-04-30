@@ -391,10 +391,10 @@ void handleSensorUARTReceive() {
                 } else {
                     Serial.println("[Sensor] UART checksum error");
                 }
+                sensorPacketStarted = false;
+                sensorRxIndex = 0;
             }
-
-            sensorPacketStarted = false;
-            sensorRxIndex = 0;
+            // If length doesn't match, 0x55 is part of payload — keep accumulating
         }
     }
 }
@@ -484,10 +484,10 @@ void handleUARTReceive() {
                 } else {
                     Serial.println("UART checksum error");
                 }
+                packetStarted = false;
+                rxIndex = 0;
             }
-
-            packetStarted = false;
-            rxIndex = 0;
+            // If length doesn't match, 0x55 is part of payload — keep accumulating
         }
     }
 }

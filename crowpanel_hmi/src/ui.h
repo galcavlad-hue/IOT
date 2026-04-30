@@ -63,6 +63,7 @@ typedef struct {
     uint32_t run_start_ms;      // millis() when relay was turned ON
     uint32_t last_repeat_ms;    // millis() of last repeat trigger
     bool blocked_by_rain;       // Currently skipped due to rain
+    int8_t last_start_day;      // Day-of-week (0-6) when schedule last triggered (-1 = never)
 } relay_schedule_t;
 
 // ============================================================

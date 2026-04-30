@@ -128,9 +128,10 @@ static void handle_manual_relay_change(int relay_idx, bool turning_on) {
             return;
         } else {
             // Action exists but condition cleared — suggest turning off
+            const char* type_name = (a->type < 5) ? action_type_names[a->type] : "Unknown";
             snprintf(ui_data.suggestion_msg, sizeof(ui_data.suggestion_msg),
                      "%s: no alarm active - consider switching off",
-                     action_type_names[a->type]);
+                     type_name);
             ui_data.suggestion_time_ms = millis();
         }
     }
@@ -276,6 +277,7 @@ static void load_schedules() {
         s->run_start_ms = 0;
         s->last_repeat_ms = 0;
         s->blocked_by_rain = false;
+        s->last_start_day = -1;
     }
     ui_prefs.end();
 }
@@ -376,6 +378,13 @@ void ui_init(relay_cmd_cb_t relay_cb, alarm_notify_cb_t alarm_cb) {
     load_volumes();
     load_schedules();
     load_actions();
+
+    // Apply saved brightness
+    ui_prefs.begin("settings", true);
+    uint8_t saved_brightness = ui_prefs.getUChar("brightness", 200);
+    ui_prefs.end();
+    display_set_brightness(saved_brightness);
+
     init_styles();
 
     // Set dark background
@@ -1518,6 +1527,17 @@ static void reset_all_names_cb(lv_event_t* e) {
     }
 }
 
+static void brightness_slider_cb(lv_event_t* e) {
+    lv_obj_t* slider = lv_event_get_target(e);
+    int32_t val = lv_slider_get_value(slider);
+    uint8_t brightness = (uint8_t)val;
+    display_set_brightness(brightness);
+    // Persist brightness setting
+    ui_prefs.begin("settings", false);
+    ui_prefs.putUChar("brightness", brightness);
+    ui_prefs.end();
+}
+
 static lv_obj_t* create_settings_button(lv_obj_t* parent, const char* text,
                                           lv_event_cb_t cb, int y_pos) {
     lv_obj_t* btn = lv_btn_create(parent);
@@ -1563,6 +1583,27 @@ static void create_settings_tab(lv_obj_t* parent) {
     lv_obj_align(relay_title, LV_ALIGN_TOP_MID, 0, 275);
 
     create_settings_button(parent, LV_SYMBOL_TRASH " Reset All Names to Default", reset_all_names_cb, 310);
+
+    // Brightness slider
+    lv_obj_t* bright_title = lv_label_create(parent);
+    lv_label_set_text(bright_title, "Screen Brightness:");
+    lv_obj_set_style_text_color(bright_title, COLOR_TEXT_DIM, 0);
+    lv_obj_set_style_text_font(bright_title, &lv_font_montserrat_16, 0);
+    lv_obj_align(bright_title, LV_ALIGN_TOP_MID, 0, 400);
+
+    lv_obj_t* slider = lv_slider_create(parent);
+    lv_obj_set_size(slider, 280, 20);
+    lv_obj_align(slider, LV_ALIGN_TOP_MID, 0, 435);
+    lv_slider_set_range(slider, 20, 255);
+    // Load saved brightness or default 200
+    ui_prefs.begin("settings", true);
+    uint8_t saved_brightness = ui_prefs.getUChar("brightness", 200);
+    ui_prefs.end();
+    lv_slider_set_value(slider, saved_brightness, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(slider, lv_color_hex(0x444444), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(slider, COLOR_ACCENT, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(slider, lv_color_hex(0xFFFFFF), LV_PART_KNOB);
+    lv_obj_add_event_cb(slider, brightness_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     // Info
     lv_obj_t* info = lv_label_create(parent);
@@ -1625,9 +1666,9 @@ void ui_update() {
     snprintf(buf, sizeof(buf), "%.0f", ui_data.rain_sensor);
     lv_label_set_text(ui_obj.lbl_rain, buf);
 
-    // Wind speed (show avg if available)
+    // Wind speed (show instant + 15min avg)
     if (ui_data.wind_avg_15min > 0.01f) {
-        snprintf(buf, sizeof(buf), "%.1f", ui_data.wind_speed);
+        snprintf(buf, sizeof(buf), "%.1f (avg %.1f)", ui_data.wind_speed, ui_data.wind_avg_15min);
         lv_label_set_text(ui_obj.lbl_wind_speed, buf);
     } else {
         snprintf(buf, sizeof(buf), "%.1f", ui_data.wind_speed);
@@ -1754,7 +1795,13 @@ void ui_set_sensor_data(float flow, float temp, float totalLiters, bool isRainin
     static int wind_buckets_filled = 0;
     static uint32_t wind_bucket_start = 0;
 
-    if (wind_bucket_start == 0) wind_bucket_start = millis();
+    if (wind_bucket_start == 0) {
+        wind_bucket_start = millis();
+        // Pre-fill all buckets with first reading to avoid trigger/clear oscillation
+        for (int b = 0; b < 15; b++) wind_buckets[b] = windSpeed;
+        wind_buckets_filled = 15;
+        ui_data.wind_avg_15min = windSpeed;
+    }
 
     wind_bucket_sum += windSpeed;
     wind_bucket_samples++;
@@ -1791,9 +1838,9 @@ void ui_set_sensor_data(float flow, float temp, float totalLiters, bool isRainin
     }
     lastTotalLiters = totalLiters;
 
-    // Save every minute
+    // Save every 5 minutes (NVS wear: ~100k writes/key, 5min = ~3 years)
     static uint32_t lastVolumeSave = 0;
-    if (millis() - lastVolumeSave > 60000) {
+    if (millis() - lastVolumeSave > 300000) {
         lastVolumeSave = millis();
         save_volumes();
     }
@@ -1918,7 +1965,7 @@ void ui_process_schedules(uint8_t current_hour, uint8_t current_minute, uint8_t 
         }
         s->blocked_by_rain = false;
 
-        // Check if current time matches start time
+        // Check if current time matches start time (1-minute window to avoid missed starts)
         bool at_start_time = (current_hour == s->start_hour && current_minute == s->start_minute);
 
         // Duration in milliseconds
@@ -1935,8 +1982,11 @@ void ui_process_schedules(uint8_t current_hour, uint8_t current_minute, uint8_t 
             // Check if should start
             bool should_start = false;
 
-            if (at_start_time && s->run_start_ms == 0) {
+            // Primary start: fires once per day at start_time
+            // Uses last_start_day to prevent re-triggering same day
+            if (at_start_time && s->last_start_day != current_dow) {
                 should_start = true;
+                s->last_start_day = current_dow;
             } else if (s->repeat && s->last_repeat_ms > 0) {
                 uint32_t interval_ms = (uint32_t)(s->repeat_interval_hours * 3600000.0f);
                 if (now - s->last_repeat_ms >= interval_ms) {

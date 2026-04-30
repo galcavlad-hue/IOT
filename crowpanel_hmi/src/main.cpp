@@ -228,10 +228,10 @@ void handleUartReceive() {
                 } else {
                     Serial.println("UART checksum error");
                 }
+                uartPacketStarted = false;
+                uartRxIdx = 0;
             }
-
-            uartPacketStarted = false;
-            uartRxIdx = 0;
+            // If length doesn't match, 0x55 is part of payload — keep accumulating
         }
     }
 }

@@ -12,6 +12,8 @@
 #include <Adafruit_ADS1X15.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <Preferences.h>
+#include <esp_task_wdt.h>
 #include "protocol.h"
 
 // ---- Pin definitions ----
@@ -24,13 +26,17 @@
 
 // ---- ADS1115 (address 0x49: ADDR pin tied to VDD) ----
 // Channel A0: Wind speed sensor (0-5V output, 0-60 m/s)
-// ADS1115 gain = GAIN_ONE → ±4.096V (1 bit = 0.125mV)
 Adafruit_ADS1115 ads;
 bool adsOnline = false;
+uint32_t lastAdsProbe = 0;
+#define ADS_REPROBE_INTERVAL_MS 30000  // Re-probe every 30s if offline
 
-// ---- DS18B20 ----
+// ---- DS18B20 (non-blocking reads) ----
 OneWire oneWire(DS18B20_PIN);
 DallasTemperature ds18b20(&oneWire);
+bool ds18b20ConversionPending = false;
+uint32_t ds18b20RequestTime = 0;
+#define DS18B20_CONVERSION_MS 750  // 12-bit resolution takes 750ms
 
 // ---- Flow sensor ----
 volatile uint32_t pulseCount = 0;
@@ -40,14 +46,34 @@ void IRAM_ATTR onPulse() {
     pulseCount++;
 }
 
+// ---- Persistence (save totalLiters to flash) ----
+Preferences prefs;
+float lastSavedLiters = 0;
+uint32_t lastLitersSave = 0;
+#define LITERS_SAVE_INTERVAL_MS 300000  // Save every 5 minutes
+#define LITERS_SAVE_DELTA       100.0f  // Or when 100L accumulated
+
 // ---- Sensor data ----
 sensor_data_payload_t sensorData;
 
-// ---- Read all sensors ----
+// ---- Read all sensors (non-blocking) ----
 void readSensors(uint32_t intervalMs) {
-    // DS18B20
-    ds18b20.requestTemperatures();
-    sensorData.temperature = ds18b20.getTempCByIndex(0);
+    // DS18B20: read result from previous cycle's request
+    if (ds18b20ConversionPending &&
+        (millis() - ds18b20RequestTime >= DS18B20_CONVERSION_MS)) {
+        float temp = ds18b20.getTempCByIndex(0);
+        if (temp != DEVICE_DISCONNECTED_C && temp > -50.0f && temp < 85.0f) {
+            sensorData.temperature = temp;
+        }
+        ds18b20ConversionPending = false;
+    }
+
+    // DS18B20: request new conversion (will be ready next cycle)
+    if (!ds18b20ConversionPending) {
+        ds18b20.requestTemperatures();
+        ds18b20ConversionPending = true;
+        ds18b20RequestTime = millis();
+    }
 
     // Flow
     noInterrupts();
@@ -70,14 +96,39 @@ void readSensors(uint32_t intervalMs) {
         int16_t rawAdc = ads.readADC_SingleEnded(0);
         float voltage = ads.computeVolts(rawAdc);
         if (voltage < 1.0f) {
-            // Below 1V = sensor error or disconnected
             sensorData.windSpeed = 0.0f;
         } else {
-            // 1V→0 m/s, 5V→60 m/s: windSpeed = (voltage - 1) / 4 * 60
             sensorData.windSpeed = ((voltage - 1.0f) / 4.0f) * 60.0f;
         }
     } else {
         sensorData.windSpeed = 0.0f;
+    }
+
+    // Persist totalLiters periodically to survive power loss
+    uint32_t now = millis();
+    if ((now - lastLitersSave >= LITERS_SAVE_INTERVAL_MS) ||
+        (totalLiters - lastSavedLiters >= LITERS_SAVE_DELTA)) {
+        prefs.begin("sensor", false);
+        prefs.putFloat("totalL", totalLiters);
+        prefs.end();
+        lastSavedLiters = totalLiters;
+        lastLitersSave = now;
+    }
+}
+
+// ---- ADS1115 re-probe (recovers from I2C bus glitch) ----
+void probeAds1115() {
+    if (adsOnline) return;
+    if (millis() - lastAdsProbe < ADS_REPROBE_INTERVAL_MS) return;
+    lastAdsProbe = millis();
+
+    Wire.beginTransmission(0x49);
+    if (Wire.endTransmission() == 0) {
+        if (ads.begin(0x49, &Wire)) {
+            ads.setGain(GAIN_TWOTHIRDS);
+            adsOnline = true;
+            Serial.println("ADS1115 recovered at 0x49");
+        }
     }
 }
 
@@ -118,6 +169,10 @@ void printSensors() {
 void setup() {
     Serial.begin(115200);
 
+    // Hardware watchdog: reset if loop stalls > 10 seconds
+    esp_task_wdt_init(10, true);
+    esp_task_wdt_add(NULL);
+
     // UART1 to Wroom
     Serial1.begin(UART_BAUD_RATE, SERIAL_8N1, SENSOR_NODE_UART_RX, SENSOR_NODE_UART_TX);
 
@@ -141,13 +196,24 @@ void setup() {
     // Rain sensor
     pinMode(RAIN_DO_PIN, INPUT);
 
-    // DS18B20
+    // DS18B20 (non-blocking mode)
     ds18b20.begin();
+    ds18b20.setWaitForConversion(false);
+
+    // Restore totalLiters from flash
+    prefs.begin("sensor", true);
+    totalLiters = prefs.getFloat("totalL", 0.0f);
+    lastSavedLiters = totalLiters;
+    prefs.end();
+    Serial.printf("Restored totalLiters: %.3f L\n", totalLiters);
 
     Serial.println("Sensor Node ready (UART mode)");
 }
 
 void loop() {
+    // Feed watchdog
+    esp_task_wdt_reset();
+
     static uint32_t lastSend = 0;
     if (millis() - lastSend >= 2000) {
         lastSend = millis();
@@ -155,5 +221,9 @@ void loop() {
         sendSensorPacket();
         printSensors();
     }
+
+    // Re-probe ADS1115 if offline
+    if (!adsOnline) probeAds1115();
+
     delay(10);
 }
