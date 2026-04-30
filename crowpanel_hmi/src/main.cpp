@@ -342,6 +342,7 @@ void loop() {
         uint8_t h, m, dow;
         getCurrentTime(&h, &m, &dow);
         display_lock(-1);
+        ui_set_time(h, m, dow, timeSynced);
         ui_process_schedules(h, m, dow);
         display_unlock();
     }

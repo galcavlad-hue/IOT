@@ -39,9 +39,15 @@ static void create_rename_overlay(void);
 static void create_schedule_overlay(void);
 static void create_action_overlay(void);
 static lv_obj_t* create_sensor_card(lv_obj_t* parent, const char* title,
-                                     const char* icon, lv_color_t color);
+                                     const char* unit, lv_color_t color,
+                                     lv_obj_t** value_label);
 static void refresh_schedule_list(void);
 static void refresh_action_cards(void);
+static void refresh_event_log(void);
+
+// Toast state
+static uint32_t toast_show_time = 0;
+#define TOAST_DURATION_MS 3000
 
 // Action type display names (needed early for handle_manual_relay_change)
 static const char* action_type_names[] = {
@@ -425,6 +431,24 @@ void ui_init(relay_cmd_cb_t relay_cb, alarm_notify_cb_t alarm_cb) {
     create_rename_overlay();
     create_schedule_overlay();
     create_action_overlay();
+
+    // --- Toast notification (on lv_scr_act so it shows above all tabs) ---
+    ui_obj.toast_obj = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(ui_obj.toast_obj, 400, 44);
+    lv_obj_align(ui_obj.toast_obj, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(ui_obj.toast_obj, lv_color_hex(0x2d2d2d), 0);
+    lv_obj_set_style_bg_opa(ui_obj.toast_obj, LV_OPA_90, 0);
+    lv_obj_set_style_border_width(ui_obj.toast_obj, 0, 0);
+    lv_obj_set_style_radius(ui_obj.toast_obj, 22, 0);
+    lv_obj_set_style_pad_all(ui_obj.toast_obj, 10, 0);
+    lv_obj_clear_flag(ui_obj.toast_obj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ui_obj.toast_obj, LV_OBJ_FLAG_HIDDEN);
+
+    ui_obj.toast_label = lv_label_create(ui_obj.toast_obj);
+    lv_label_set_text(ui_obj.toast_label, "");
+    lv_obj_set_style_text_font(ui_obj.toast_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(ui_obj.toast_label, lv_color_white(), 0);
+    lv_obj_center(ui_obj.toast_label);
 }
 
 // ============================================================
@@ -463,6 +487,19 @@ static lv_obj_t* create_sensor_card(lv_obj_t* parent, const char* title,
 
 static void create_dashboard_tab(lv_obj_t* parent) {
     lv_obj_set_style_pad_all(parent, 8, 0);
+
+    // --- Clock & Next Schedule (top-right corner) ---
+    ui_obj.lbl_clock = lv_label_create(parent);
+    lv_label_set_text(ui_obj.lbl_clock, "--:--");
+    lv_obj_set_style_text_font(ui_obj.lbl_clock, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(ui_obj.lbl_clock, COLOR_HIGHLIGHT, 0);
+    lv_obj_align(ui_obj.lbl_clock, LV_ALIGN_TOP_RIGHT, -10, -2);
+
+    ui_obj.lbl_next_schedule = lv_label_create(parent);
+    lv_label_set_text(ui_obj.lbl_next_schedule, "");
+    lv_obj_set_style_text_font(ui_obj.lbl_next_schedule, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ui_obj.lbl_next_schedule, COLOR_TEXT_DIM, 0);
+    lv_obj_align(ui_obj.lbl_next_schedule, LV_ALIGN_TOP_RIGHT, -10, 22);
 
     // --- Alarm Banner (hidden by default, spans full width at top) ---
     ui_obj.lbl_alarm_banner = lv_obj_create(parent);
@@ -584,6 +621,13 @@ static void create_dashboard_tab(lv_obj_t* parent) {
     lv_obj_set_style_text_font(ui_obj.lbl_uart_status, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(ui_obj.lbl_uart_status, COLOR_TEXT_DIM, 0);
     lv_obj_align(ui_obj.lbl_uart_status, LV_ALIGN_LEFT_MID, 0, 28);
+
+    // Last updated indicator (below status card)
+    ui_obj.lbl_last_updated = lv_label_create(parent);
+    lv_label_set_text(ui_obj.lbl_last_updated, "Data: --");
+    lv_obj_set_style_text_font(ui_obj.lbl_last_updated, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ui_obj.lbl_last_updated, COLOR_TEXT_DIM, 0);
+    lv_obj_set_pos(ui_obj.lbl_last_updated, 684, row2_y + card_h + 4);
 }
 
 // ============================================================
@@ -605,6 +649,12 @@ static void relay_btn_click_cb(lv_event_t* e) {
         on_relay_command(relay_idx, newState ? 1 : 0);
         ui_data.cmd_pending |= (1 << relay_idx);
     }
+
+    // Toast feedback
+    char toast_buf[48];
+    snprintf(toast_buf, sizeof(toast_buf), "%s %s %s",
+             LV_SYMBOL_OK, ui_data.relay_names[relay_idx], newState ? "ON" : "OFF");
+    ui_show_toast(toast_buf);
 }
 
 static void relay_btn_longpress_cb(lv_event_t* e) {
@@ -671,8 +721,8 @@ static void create_relays_tab(lv_obj_t* parent) {
 
     // Hint at bottom
     lv_obj_t* hint = lv_label_create(parent);
-    lv_label_set_text(hint, "Tap to toggle  |  Long press to rename");
-    lv_obj_set_style_text_color(hint, COLOR_TEXT_DIM, 0);
+    lv_label_set_text(hint, LV_SYMBOL_OK " Tap = toggle relay    " LV_SYMBOL_EDIT " Long press = rename relay");
+    lv_obj_set_style_text_color(hint, COLOR_HIGHLIGHT, 0);
     lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -5);
 }
@@ -694,6 +744,7 @@ static void rename_kb_event_cb(lv_event_t* e) {
             ui_data.relay_names[idx][RELAY_NAME_MAX - 1] = '\0';
             save_relay_name(idx);
             lv_label_set_text(ui_obj.relay_labels[idx], ui_data.relay_names[idx]);
+            ui_show_toast(LV_SYMBOL_OK " Relay renamed");
         }
         lv_obj_add_flag(ui_obj.rename_overlay, LV_OBJ_FLAG_HIDDEN);
     } else if (code == LV_EVENT_CANCEL) {
@@ -865,13 +916,16 @@ static void refresh_schedule_list() {
         // Running indicator
         lv_obj_t* status = lv_label_create(row);
         lv_obj_set_style_text_font(status, &lv_font_montserrat_14, 0);
-        lv_obj_set_width(status, 80);
+        lv_obj_set_width(status, 100);
         if (s->currently_running) {
             lv_label_set_text(status, LV_SYMBOL_PLAY " ON");
             lv_obj_set_style_text_color(status, COLOR_RELAY_ON, 0);
         } else if (s->blocked_by_rain) {
             lv_label_set_text(status, LV_SYMBOL_TINT " Rain");
             lv_obj_set_style_text_color(status, COLOR_RAIN, 0);
+        } else if (s->enabled && ((ui_data.manual_override >> i) & 1)) {
+            lv_label_set_text(status, LV_SYMBOL_PAUSE " Override");
+            lv_obj_set_style_text_color(status, COLOR_SCHED, 0);
         } else {
             lv_label_set_text(status, "");
         }
@@ -942,6 +996,7 @@ static void sched_save_cb(lv_event_t* e) {
     refresh_schedule_list();
 
     lv_obj_add_flag(ui_obj.sched_overlay, LV_OBJ_FLAG_HIDDEN);
+    ui_show_toast(LV_SYMBOL_OK " Schedule saved");
 }
 
 static void sched_cancel_cb(lv_event_t* e) {
@@ -1153,6 +1208,13 @@ static void action_dismiss_cb(lv_event_t* e) {
         if (on_alarm_notify) on_alarm_notify(idx, (uint8_t)a->type, false,
                                               true, 0.0f, a->threshold);
         refresh_action_cards();
+
+        // Log + explain to user
+        const char* type_name = (a->type < 5) ? action_type_names[a->type] : "Unknown";
+        char log_buf[EVENT_MSG_LEN];
+        snprintf(log_buf, sizeof(log_buf), "Dismissed: %s", type_name);
+        ui_log_event(log_buf);
+        ui_show_toast("Alarm paused. Toggle relay to re-enable.");
     }
 }
 
@@ -1371,6 +1433,7 @@ static void action_save_cb(lv_event_t* e) {
     save_actions();
     update_action_description(idx);
     lv_obj_add_flag(ui_obj.action_overlay, LV_OBJ_FLAG_HIDDEN);
+    ui_show_toast(LV_SYMBOL_OK " Action updated");
 }
 
 static void action_cancel_cb(lv_event_t* e) {
@@ -1505,16 +1568,19 @@ static void create_action_overlay() {
 static void reset_day_cb(lv_event_t* e) {
     ui_data.water_volume_day = 0;
     save_volumes();
+    ui_show_toast(LV_SYMBOL_OK " Daily volume reset");
 }
 
 static void reset_month_cb(lv_event_t* e) {
     ui_data.water_volume_month = 0;
     save_volumes();
+    ui_show_toast(LV_SYMBOL_OK " Monthly volume reset");
 }
 
 static void reset_year_cb(lv_event_t* e) {
     ui_data.water_volume_year = 0;
     save_volumes();
+    ui_show_toast(LV_SYMBOL_OK " Yearly volume reset");
 }
 
 static void reset_all_names_cb(lv_event_t* e) {
@@ -1605,19 +1671,38 @@ static void create_settings_tab(lv_obj_t* parent) {
     lv_obj_set_style_bg_color(slider, lv_color_hex(0xFFFFFF), LV_PART_KNOB);
     lv_obj_add_event_cb(slider, brightness_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    // Info
+    // Tip text
     lv_obj_t* info = lv_label_create(parent);
-    lv_label_set_text(info, "Long-press any relay button to rename it.");
-    lv_obj_set_style_text_color(info, COLOR_TEXT_DIM, 0);
+    lv_label_set_text(info, LV_SYMBOL_EDIT " Tip: Long-press any relay button to rename it.");
+    lv_obj_set_style_text_color(info, COLOR_HIGHLIGHT, 0);
     lv_obj_set_style_text_font(info, &lv_font_montserrat_14, 0);
-    lv_obj_align(info, LV_ALIGN_TOP_MID, 0, 375);
+    lv_obj_align(info, LV_ALIGN_TOP_LEFT, 15, 475);
+
+    // --- Event Log (right column) ---
+    lv_obj_t* log_title = lv_label_create(parent);
+    lv_label_set_text(log_title, LV_SYMBOL_LIST " Event Log (last 20):");
+    lv_obj_set_style_text_color(log_title, COLOR_TEXT_DIM, 0);
+    lv_obj_set_style_text_font(log_title, &lv_font_montserrat_16, 0);
+    lv_obj_set_pos(log_title, 520, 45);
+
+    ui_obj.event_log_list = lv_obj_create(parent);
+    lv_obj_set_size(ui_obj.event_log_list, 440, 400);
+    lv_obj_set_pos(ui_obj.event_log_list, 520, 75);
+    lv_obj_set_style_bg_color(ui_obj.event_log_list, lv_color_hex(0x111111), 0);
+    lv_obj_set_style_bg_opa(ui_obj.event_log_list, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(ui_obj.event_log_list, COLOR_ACCENT, 0);
+    lv_obj_set_style_border_width(ui_obj.event_log_list, 1, 0);
+    lv_obj_set_style_radius(ui_obj.event_log_list, 8, 0);
+    lv_obj_set_style_pad_all(ui_obj.event_log_list, 8, 0);
+    lv_obj_set_flex_flow(ui_obj.event_log_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ui_obj.event_log_list, 2, 0);
 
     // Version info
     lv_obj_t* ver = lv_label_create(parent);
-    lv_label_set_text(ver, "CrowPanel HMI System v1.0");
+    lv_label_set_text(ver, "CrowPanel HMI System v1.1");
     lv_obj_set_style_text_color(ver, COLOR_TEXT_DIM, 0);
     lv_obj_set_style_text_font(ver, &lv_font_montserrat_12, 0);
-    lv_obj_align(ver, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_align(ver, LV_ALIGN_BOTTOM_LEFT, 15, -10);
 }
 
 // ============================================================
@@ -1652,7 +1737,52 @@ static void update_relay_buttons() {
 // Update UI with latest data
 // ============================================================
 void ui_update() {
-    char buf[32];
+    char buf[64];
+    uint32_t now = millis();
+
+    // --- Clock display ---
+    if (ui_obj.lbl_clock) {
+        if (ui_data.time_synced) {
+            snprintf(buf, sizeof(buf), "%02d:%02d", ui_data.current_hour, ui_data.current_minute);
+        } else {
+            snprintf(buf, sizeof(buf), "--:-- (no sync)");
+        }
+        lv_label_set_text(ui_obj.lbl_clock, buf);
+    }
+
+    // --- Next scheduled event ---
+    if (ui_obj.lbl_next_schedule) {
+        bool found_next = false;
+        int best_relay = -1;
+        int best_minutes = 99999;  // minutes until next event
+
+        for (int i = 0; i < NUM_RELAYS; i++) {
+            relay_schedule_t* s = &ui_data.schedules[i];
+            if (!s->enabled || s->currently_running) continue;
+            if (!(s->days_mask & (1 << ui_data.current_dow))) continue;
+            if ((ui_data.manual_override >> i) & 1) continue;
+
+            int sched_min = s->start_hour * 60 + s->start_minute;
+            int now_min = ui_data.current_hour * 60 + ui_data.current_minute;
+            int diff = sched_min - now_min;
+            if (diff <= 0) continue;  // Already passed today
+
+            if (diff < best_minutes) {
+                best_minutes = diff;
+                best_relay = i;
+                found_next = true;
+            }
+        }
+
+        if (found_next && best_relay >= 0) {
+            relay_schedule_t* s = &ui_data.schedules[best_relay];
+            snprintf(buf, sizeof(buf), "Next: %s at %02d:%02d",
+                     ui_data.relay_names[best_relay], s->start_hour, s->start_minute);
+            lv_label_set_text(ui_obj.lbl_next_schedule, buf);
+        } else {
+            lv_label_set_text(ui_obj.lbl_next_schedule, "No upcoming schedules today");
+        }
+    }
 
     // Water flow
     snprintf(buf, sizeof(buf), "%.2f", ui_data.water_flow_rate);
@@ -1662,8 +1792,21 @@ void ui_update() {
     snprintf(buf, sizeof(buf), "%.1f", ui_data.water_temperature);
     lv_label_set_text(ui_obj.lbl_water_temp, buf);
 
-    // Rain
-    snprintf(buf, sizeof(buf), "%.0f", ui_data.rain_sensor);
+    // Rain - graduated display from analog value
+    if (ui_data.rain_analog > 0) {
+        // Rain sensor: 4095 = dry, 0 = soaked. Invert to percentage.
+        int rain_pct = ((4095 - ui_data.rain_analog) * 100) / 4095;
+        if (rain_pct < 0) rain_pct = 0;
+        if (rain_pct > 100) rain_pct = 100;
+        const char* rain_desc = "";
+        if (rain_pct == 0) rain_desc = "Dry";
+        else if (rain_pct < 25) rain_desc = "Light";
+        else if (rain_pct < 60) rain_desc = "Moderate";
+        else rain_desc = "Heavy";
+        snprintf(buf, sizeof(buf), "%d%% %s", rain_pct, rain_desc);
+    } else {
+        snprintf(buf, sizeof(buf), "%.0f%%", ui_data.rain_sensor);
+    }
     lv_label_set_text(ui_obj.lbl_rain, buf);
 
     // Wind speed (show instant + 15min avg)
@@ -1692,8 +1835,7 @@ void ui_update() {
     snprintf(buf, sizeof(buf), "%.1f", ui_data.room_humidity);
     lv_label_set_text(ui_obj.lbl_room_humid, buf);
 
-    // Connection status
-    uint32_t now = millis();
+    // Connection status + last updated
     bool sensor_ok = (now - ui_data.last_sensor_time) < 10000;
     bool uart_ok = (now - ui_data.last_uart_time) < 5000;
 
@@ -1707,50 +1849,77 @@ void ui_update() {
     lv_obj_set_style_text_color(ui_obj.lbl_uart_status,
                                  uart_ok ? COLOR_RELAY_ON : COLOR_WARN, 0);
 
+    // Last updated indicator
+    if (ui_obj.lbl_last_updated) {
+        uint32_t age_sec = (now - ui_data.last_sensor_time) / 1000;
+        if (ui_data.last_sensor_time == 0) {
+            lv_label_set_text(ui_obj.lbl_last_updated, "Data: waiting...");
+        } else if (age_sec < 5) {
+            lv_label_set_text(ui_obj.lbl_last_updated, "Data: live");
+            lv_obj_set_style_text_color(ui_obj.lbl_last_updated, COLOR_RELAY_ON, 0);
+        } else if (age_sec < 30) {
+            snprintf(buf, sizeof(buf), "Data: %lus ago", age_sec);
+            lv_label_set_text(ui_obj.lbl_last_updated, buf);
+            lv_obj_set_style_text_color(ui_obj.lbl_last_updated, COLOR_TEXT_DIM, 0);
+        } else {
+            snprintf(buf, sizeof(buf), "Data: STALE (%lus)", age_sec);
+            lv_label_set_text(ui_obj.lbl_last_updated, buf);
+            lv_obj_set_style_text_color(ui_obj.lbl_last_updated, COLOR_WARN, 0);
+        }
+    }
+
     // Update relay buttons
     update_relay_buttons();
 
-    // --- Alarm Banner ---
+    // --- Alarm Banner (multi-alarm count) ---
     if (ui_obj.lbl_alarm_banner) {
-        bool any_alarm = false;
-        const char* alarm_msg = nullptr;
+        int alarm_count = 0;
+        const char* first_alarm_msg = nullptr;
 
         for (int i = 0; i < ui_data.num_actions && i < MAX_ACTIONS; i++) {
             if (ui_data.actions[i].enabled && ui_data.actions[i].triggered) {
-                any_alarm = true;
-                switch (ui_data.actions[i].type) {
-                    case ACTION_WATER_FLOW_ALARM:
-                        alarm_msg = "PIPE LEAK! Water flow above threshold.";
-                        break;
-                    case ACTION_RAIN_AUTO:
-                        alarm_msg = "Rain detected \xe2\x80\x94 auto-close relay activated.";
-                        break;
-                    case ACTION_NO_WATER:
-                        alarm_msg = "NO WATER! Scheduled relay running but no flow.";
-                        break;
-                    case ACTION_FREEZING_TEMP:
-                        alarm_msg = "FREEZING! Emergency water dump in progress.";
-                        break;
-                    case ACTION_WIND_SPEED:
-                        alarm_msg = "HIGH WIND! Protective relay activated.";
-                        break;
-                    default:
-                        alarm_msg = "ALARM ACTIVE";
-                        break;
+                alarm_count++;
+                if (!first_alarm_msg) {
+                    switch (ui_data.actions[i].type) {
+                        case ACTION_WATER_FLOW_ALARM:
+                            first_alarm_msg = "PIPE LEAK! Water flow above threshold.";
+                            break;
+                        case ACTION_RAIN_AUTO:
+                            first_alarm_msg = "Rain detected \xe2\x80\x94 auto-close relay activated.";
+                            break;
+                        case ACTION_NO_WATER:
+                            first_alarm_msg = "NO WATER! Scheduled relay running but no flow.";
+                            break;
+                        case ACTION_FREEZING_TEMP:
+                            first_alarm_msg = "FREEZING! Emergency water dump in progress.";
+                            break;
+                        case ACTION_WIND_SPEED:
+                            first_alarm_msg = "HIGH WIND! Protective relay activated.";
+                            break;
+                        default:
+                            first_alarm_msg = "ALARM ACTIVE";
+                            break;
+                    }
                 }
-                break;  // Show first active alarm
             }
         }
 
-        if (any_alarm && alarm_msg) {
+        if (alarm_count > 0 && first_alarm_msg) {
             lv_obj_clear_flag(ui_obj.lbl_alarm_banner, LV_OBJ_FLAG_HIDDEN);
             lv_obj_set_style_bg_color(ui_obj.lbl_alarm_banner, COLOR_WARN, 0);
             lv_obj_t* alarm_text = (lv_obj_t*)lv_obj_get_user_data(ui_obj.lbl_alarm_banner);
             if (alarm_text) {
-                lv_label_set_text(alarm_text, alarm_msg);
+                if (alarm_count > 1) {
+                    char multi_buf[128];
+                    snprintf(multi_buf, sizeof(multi_buf), "%s (+%d more)",
+                             first_alarm_msg, alarm_count - 1);
+                    lv_label_set_text(alarm_text, multi_buf);
+                } else {
+                    lv_label_set_text(alarm_text, first_alarm_msg);
+                }
             }
         } else if (ui_data.suggestion_time_ms > 0 &&
-                   (millis() - ui_data.suggestion_time_ms < 8000)) {
+                   (now - ui_data.suggestion_time_ms < 8000)) {
             // Show suggestion (orange banner, 8 seconds)
             lv_obj_clear_flag(ui_obj.lbl_alarm_banner, LV_OBJ_FLAG_HIDDEN);
             lv_obj_set_style_bg_color(ui_obj.lbl_alarm_banner, COLOR_SCHED, 0);
@@ -1760,17 +1929,25 @@ void ui_update() {
             }
         } else {
             if (ui_data.suggestion_time_ms > 0 &&
-                (millis() - ui_data.suggestion_time_ms >= 8000)) {
+                (now - ui_data.suggestion_time_ms >= 8000)) {
                 ui_data.suggestion_time_ms = 0; // Expire
             }
             lv_obj_add_flag(ui_obj.lbl_alarm_banner, LV_OBJ_FLAG_HIDDEN);
         }
     }
 
+    // --- Toast auto-hide ---
+    if (ui_obj.toast_obj && toast_show_time > 0) {
+        if (now - toast_show_time >= TOAST_DURATION_MS) {
+            lv_obj_add_flag(ui_obj.toast_obj, LV_OBJ_FLAG_HIDDEN);
+            toast_show_time = 0;
+        }
+    }
+
     // Update schedule list periodically (running status changes)
     static uint32_t lastSchedRefresh = 0;
-    if (millis() - lastSchedRefresh > 2000) {
-        lastSchedRefresh = millis();
+    if (now - lastSchedRefresh > 2000) {
+        lastSchedRefresh = now;
         refresh_schedule_list();
     }
 }
@@ -1782,6 +1959,7 @@ void ui_set_sensor_data(float flow, float temp, float totalLiters, bool isRainin
     ui_data.water_flow_rate = flow;
     ui_data.water_temperature = temp;
     ui_data.rain_sensor = isRaining ? 100.0f : 0.0f;  // Map bool to percentage for UI thresholds
+    ui_data.rain_analog = rainAnalog;  // Store analog value for graduated display
     ui_data.wind_speed = windSpeed;
     ui_data.last_sensor_time = millis();
     ui_data.sensor_node_connected = true;
@@ -1921,6 +2099,68 @@ void ui_check_volume_reset(uint8_t day, uint8_t month, uint16_t year) {
 }
 
 // ============================================================
+// Time setter (called from main loop)
+// ============================================================
+void ui_set_time(uint8_t hour, uint8_t minute, uint8_t dow, bool synced) {
+    ui_data.current_hour = hour;
+    ui_data.current_minute = minute;
+    ui_data.current_dow = dow;
+    ui_data.time_synced = synced;
+}
+
+// ============================================================
+// Toast notification (brief 3-second popup)
+// ============================================================
+void ui_show_toast(const char* msg) {
+    if (!ui_obj.toast_obj || !ui_obj.toast_label) return;
+    lv_label_set_text(ui_obj.toast_label, msg);
+    lv_obj_clear_flag(ui_obj.toast_obj, LV_OBJ_FLAG_HIDDEN);
+    toast_show_time = millis();
+}
+
+// ============================================================
+// Event log (circular buffer of recent events)
+// ============================================================
+void ui_log_event(const char* msg) {
+    // Format with timestamp
+    char entry[EVENT_MSG_LEN];
+    if (ui_data.time_synced) {
+        snprintf(entry, sizeof(entry), "%02d:%02d  %s",
+                 ui_data.current_hour, ui_data.current_minute, msg);
+    } else {
+        snprintf(entry, sizeof(entry), "--:--  %s", msg);
+    }
+    strncpy(ui_data.event_log[ui_data.event_log_head], entry, EVENT_MSG_LEN - 1);
+    ui_data.event_log[ui_data.event_log_head][EVENT_MSG_LEN - 1] = '\0';
+    ui_data.event_log_head = (ui_data.event_log_head + 1) % EVENT_LOG_SIZE;
+    if (ui_data.event_log_count < EVENT_LOG_SIZE) ui_data.event_log_count++;
+    refresh_event_log();
+}
+
+static void refresh_event_log() {
+    if (!ui_obj.event_log_list) return;
+    lv_obj_clean(ui_obj.event_log_list);
+
+    if (ui_data.event_log_count == 0) {
+        lv_obj_t* empty = lv_label_create(ui_obj.event_log_list);
+        lv_label_set_text(empty, "No events yet.");
+        lv_obj_set_style_text_color(empty, COLOR_TEXT_DIM, 0);
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_12, 0);
+        return;
+    }
+
+    // Show events newest first
+    for (int n = 0; n < ui_data.event_log_count; n++) {
+        int idx = (ui_data.event_log_head - 1 - n + EVENT_LOG_SIZE) % EVENT_LOG_SIZE;
+        lv_obj_t* lbl = lv_label_create(ui_obj.event_log_list);
+        lv_label_set_text(lbl, ui_data.event_log[idx]);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(lbl, COLOR_TEXT, 0);
+        lv_obj_set_width(lbl, 420);
+    }
+}
+
+// ============================================================
 // Schedule Engine
 // Called from main loop with current time (from RTC or millis-derived)
 // current_dow: 0=Monday, 6=Sunday
@@ -1998,6 +2238,11 @@ void ui_process_schedules(uint8_t current_hour, uint8_t current_minute, uint8_t 
                 s->currently_running = true;
                 s->run_start_ms = now;
                 if (!override) relay_command(i, 1);
+                // Log schedule start
+                char log_buf[EVENT_MSG_LEN];
+                snprintf(log_buf, sizeof(log_buf), "Schedule: %s started (%.1fh)",
+                         ui_data.relay_names[i], s->duration_hours);
+                ui_log_event(log_buf);
             }
         }
     }
@@ -2157,6 +2402,24 @@ void ui_process_actions() {
             default:
                 break;
         }
+    }
+
+    // Log trigger/clear transitions
+    static bool prev_triggered[MAX_ACTIONS] = {false};
+    for (int i = 0; i < ui_data.num_actions && i < MAX_ACTIONS; i++) {
+        action_rule_t* a = &ui_data.actions[i];
+        if (a->triggered && !prev_triggered[i]) {
+            const char* type_name = (a->type < 5) ? action_type_names[a->type] : "Unknown";
+            char log_buf[EVENT_MSG_LEN];
+            snprintf(log_buf, sizeof(log_buf), "TRIGGERED: %s", type_name);
+            ui_log_event(log_buf);
+        } else if (!a->triggered && prev_triggered[i]) {
+            const char* type_name = (a->type < 5) ? action_type_names[a->type] : "Unknown";
+            char log_buf[EVENT_MSG_LEN];
+            snprintf(log_buf, sizeof(log_buf), "Cleared: %s", type_name);
+            ui_log_event(log_buf);
+        }
+        prev_triggered[i] = a->triggered;
     }
 
     // Update action card status labels

@@ -87,6 +87,10 @@ typedef struct {
     uint32_t trigger_time_ms;   // millis() when triggered (runtime)
 } action_rule_t;
 
+// Event log constants
+#define EVENT_LOG_SIZE 20
+#define EVENT_MSG_LEN 64
+
 typedef struct {
     // Water sensor data (from Wroom UART, originally from sensor node)
     float water_flow_rate;      // L/min
@@ -128,6 +132,20 @@ typedef struct {
 
     // Rain threshold (% above which = raining)
     float rain_threshold;
+
+    // Rain analog value (0-4095, lower = more rain)
+    int rain_analog;
+
+    // Time tracking (updated from main loop)
+    uint8_t current_hour;
+    uint8_t current_minute;
+    uint8_t current_dow;
+    bool time_synced;
+
+    // Event log (circular buffer)
+    char event_log[EVENT_LOG_SIZE][EVENT_MSG_LEN];
+    uint8_t event_log_head;     // Next write position
+    uint8_t event_log_count;    // Total entries (max EVENT_LOG_SIZE)
 } ui_data_t;
 
 // ============================================================
@@ -155,6 +173,12 @@ typedef struct {
     lv_obj_t* lbl_sensor_status;
     lv_obj_t* lbl_uart_status;
     lv_obj_t* lbl_alarm_banner;
+    lv_obj_t* lbl_clock;            // System clock display
+    lv_obj_t* lbl_next_schedule;    // Next scheduled event
+    lv_obj_t* lbl_last_updated;     // Sensor data age
+    lv_obj_t* toast_obj;            // Toast notification container
+    lv_obj_t* toast_label;          // Toast text label
+    lv_obj_t* event_log_list;       // Event log list (in Settings tab)
 
     // Relay buttons
     lv_obj_t* relay_btns[NUM_RELAYS];
@@ -227,6 +251,15 @@ void ui_dismiss_alarm(int action_index);
 
 // Time-based volume auto-reset (called when time sync received)
 void ui_check_volume_reset(uint8_t day, uint8_t month, uint16_t year);
+
+// Update system time (call from main loop)
+void ui_set_time(uint8_t hour, uint8_t minute, uint8_t dow, bool synced);
+
+// Show toast notification (brief 3s popup)
+void ui_show_toast(const char* msg);
+
+// Add event to history log
+void ui_log_event(const char* msg);
 
 // Persistence
 void save_schedules(void);
