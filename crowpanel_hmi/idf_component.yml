@@ -1,0 +1,5 @@
+dependencies:
+  lvgl/lvgl:
+    version: "^8.4.0"
+  esp-idf: ""
+
